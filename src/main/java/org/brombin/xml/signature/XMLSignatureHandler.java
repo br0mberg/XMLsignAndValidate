@@ -2,8 +2,6 @@ package org.brombin.xml.signature;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -12,7 +10,10 @@ import org.xml.sax.SAXException;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
-import javax.xml.transform.*;
+import javax.xml.transform.OutputKeys;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerException;
+import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
 import java.io.File;
@@ -30,21 +31,19 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 
-@Component
 public class XMLSignatureHandler {
     private static final Logger logger = LoggerFactory.getLogger(XMLSignatureHandler.class);
-    private String keystorePath = "keystore.jks";
-    private String keystoreType = "JKS";
+    private static final String keystorePath = "keystore.jks";
+    private static final String keystoreType = "JKS";
 
-    public void signXmlDocument(String xmlFilePath, String keystorePassword,
+    public static void signXmlDocument(String xmlFilePath, String keystorePassword,
                                 String alias, String entryPassword) throws Exception {
         logger.info("Starting XML document signing process.");
-        Document xmlDocument = getXmlDocument(xmlFilePath);
 
         KeyStore keyStore = loadKeyStore(keystorePassword);
         PrivateKey privateKey = (PrivateKey) keyStore.getKey(alias, entryPassword.toCharArray());
-        Certificate certificate = keyStore.getCertificate(alias);
 
+        Document xmlDocument = getXmlDocument(xmlFilePath);
         String normalizedContent = getNormalizedXml(xmlDocument);
         String signatureBase64 = generateSignature(normalizedContent, privateKey);
 
@@ -54,16 +53,47 @@ public class XMLSignatureHandler {
         logger.info("XML document signed successfully.");
     }
 
-    private KeyStore loadKeyStore(String keystorePassword) throws Exception {
+    public static boolean validateXmlDocument(String xmlFilePath, String keystorePassword) throws Exception {
+        logger.info("Starting XML document validation process.");
+        Document xmlDocument = getXmlDocument(xmlFilePath);
+
+        NodeList signNodesList = xmlDocument.getDocumentElement().getElementsByTagName("sign");
+        if (signNodesList.getLength() == 0) {
+            logger.warn("No <sign> nodes found in the XML file.");
+            return false;
+        }
+
+        List<Node> signNodes = extractAndRemoveSignNodes(xmlDocument, signNodesList);
+
+        KeyStore keystore = loadKeyStore(keystorePassword);
+
+        boolean allSignaturesValid = validateSignatures(xmlDocument, signNodes, keystore);
+
+        if (allSignaturesValid) {
+            logger.info("XML document validation completed successfully.");
+        } else {
+            logger.error("XML document validation failed.");
+        }
+        return allSignaturesValid;
+    }
+
+    private static Document getXmlDocument(String xmlFilePath)
+            throws ParserConfigurationException, IOException, SAXException {
+        DocumentBuilderFactory builderFactory = DocumentBuilderFactory.newInstance();
+        builderFactory.setNamespaceAware(true);
+        builderFactory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        return builderFactory.newDocumentBuilder().parse(xmlFilePath);
+    }
+
+    private static KeyStore loadKeyStore(String keystorePassword) throws Exception {
         KeyStore keyStore = KeyStore.getInstance(keystoreType);
         try (FileInputStream fis = new FileInputStream(keystorePath)) {
             keyStore.load(fis, keystorePassword.toCharArray());
         }
-
         return keyStore;
     }
 
-    private String getNormalizedXml(Document xmlDocument) throws TransformerException, ParserConfigurationException {
+    private static String getNormalizedXml(Document xmlDocument) throws TransformerException, ParserConfigurationException {
         Document newDoc = DocumentBuilderFactory.newInstance().newDocumentBuilder().newDocument();
         Element root = newDoc.createElement(xmlDocument.getDocumentElement().getTagName());
         newDoc.appendChild(root);
@@ -79,52 +109,6 @@ public class XMLSignatureHandler {
         sortChildElements(root);
 
         return convertDocumentToString(newDoc);
-    }
-
-    private String convertDocumentToString(Document xmlDocument) throws TransformerException {
-        TransformerFactory transformerFactory = TransformerFactory.newInstance();
-        Transformer transformer = transformerFactory.newTransformer();
-
-        transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
-        transformer.setOutputProperty(OutputKeys.INDENT, "no");
-        transformer.setOutputProperty(OutputKeys.METHOD, "xml");
-
-        DOMSource source = new DOMSource(xmlDocument);
-        StreamResult result = new StreamResult(new StringWriter());
-
-        transformer.transform(source, result);
-        String xmlString = result.getWriter().toString();
-
-        if (xmlString == null || xmlString.isEmpty()) {
-            throw new TransformerException("Error converting XML to string");
-        }
-
-        return xmlString.replaceAll("\\s+", "");
-    }
-
-    private String generateSignature(String content, PrivateKey privateKey) throws Exception {
-        Signature signature = Signature.getInstance("SHA256withRSA");
-        signature.initSign(privateKey);
-        signature.update(content.getBytes(StandardCharsets.UTF_8));
-        byte[] signatureBytes = signature.sign();
-        return Base64.getEncoder().encodeToString(signatureBytes);
-    }
-
-    private void addSignatureToDocument(Document xmlDocument, String alias, String signatureBase64) {
-        Element elementSign = xmlDocument.createElement("sign");
-        elementSign.setAttribute("name", alias);
-        elementSign.setTextContent(signatureBase64);
-        xmlDocument.getDocumentElement().appendChild(elementSign);
-    }
-
-    private void saveXmlDocument(Document xmlDocument, String xmlFilePath) throws TransformerException {
-        DOMSource domSource = new DOMSource(xmlDocument);
-        StreamResult streamResult = new StreamResult(new File(xmlFilePath));
-
-        TransformerFactory transformerFactory = TransformerFactory.newInstance();
-        Transformer transformer = transformerFactory.newTransformer();
-        transformer.setOutputProperty(OutputKeys.INDENT, "yes");
-        transformer.transform(domSource, streamResult);
     }
 
     private static void sortChildElements(Element element) {
@@ -150,39 +134,53 @@ public class XMLSignatureHandler {
         }
     }
 
-    private static Document getXmlDocument(String xmlFilePath)
-            throws ParserConfigurationException, IOException, SAXException {
-        DocumentBuilderFactory builderFactory = DocumentBuilderFactory.newInstance();
-        builderFactory.setNamespaceAware(true);
-        builderFactory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-        return builderFactory.newDocumentBuilder().parse(xmlFilePath);
-    }
+    private static String convertDocumentToString(Document xmlDocument) throws TransformerException {
+        TransformerFactory transformerFactory = TransformerFactory.newInstance();
+        Transformer transformer = transformerFactory.newTransformer();
 
-    public boolean validateXmlDocument(String xmlFilePath, String keystorePassword) throws Exception {
-        logger.info("Starting XML document validation process.");
-        Document xmlDocument = getXmlDocument(xmlFilePath);
+        transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
+        transformer.setOutputProperty(OutputKeys.INDENT, "no");
+        transformer.setOutputProperty(OutputKeys.METHOD, "xml");
 
-        NodeList signNodesList = xmlDocument.getDocumentElement().getElementsByTagName("sign");
-        if (signNodesList.getLength() == 0) {
-            logger.warn("No <sign> nodes found in the XML file.");
-            return false;
+        DOMSource source = new DOMSource(xmlDocument);
+        StreamResult result = new StreamResult(new StringWriter());
+
+        transformer.transform(source, result);
+        String xmlString = result.getWriter().toString();
+
+        if (xmlString == null || xmlString.isEmpty()) {
+            throw new TransformerException("Error converting XML to string");
         }
 
-        List<Node> signNodes = extractAndRemoveSignNodes(xmlDocument, signNodesList);
-
-        KeyStore keystore = loadKeyStore(keystorePassword);
-
-        boolean allSignaturesValid = validateSignatures(xmlDocument, signNodes, keystore);
-
-        if (allSignaturesValid) {
-            logger.info("XML document validation completed successfully.");
-        } else {
-            logger.error("XML document validation failed.");
-        }
-        return allSignaturesValid;
+        return xmlString.replaceAll("\\s+", "");
     }
 
-    private List<Node> extractAndRemoveSignNodes(Document xmlDocument, NodeList signNodesList) {
+    private static String generateSignature(String content, PrivateKey privateKey) throws Exception {
+        Signature signature = Signature.getInstance("SHA256withRSA");
+        signature.initSign(privateKey);
+        signature.update(content.getBytes(StandardCharsets.UTF_8));
+        byte[] signatureBytes = signature.sign();
+        return Base64.getEncoder().encodeToString(signatureBytes);
+    }
+
+    private static void addSignatureToDocument(Document xmlDocument, String alias, String signatureBase64) {
+        Element elementSign = xmlDocument.createElement("sign");
+        elementSign.setAttribute("name", alias);
+        elementSign.setTextContent(signatureBase64);
+        xmlDocument.getDocumentElement().appendChild(elementSign);
+    }
+
+    private static void saveXmlDocument(Document xmlDocument, String xmlFilePath) throws TransformerException {
+        DOMSource domSource = new DOMSource(xmlDocument);
+        StreamResult streamResult = new StreamResult(new File(xmlFilePath));
+
+        TransformerFactory transformerFactory = TransformerFactory.newInstance();
+        Transformer transformer = transformerFactory.newTransformer();
+        transformer.setOutputProperty(OutputKeys.INDENT, "yes");
+        transformer.transform(domSource, streamResult);
+    }
+
+    private static List<Node> extractAndRemoveSignNodes(Document xmlDocument, NodeList signNodesList) {
         List<Node> signNodes = new ArrayList<>();
         for (int i = 0; i < signNodesList.getLength(); ++i) {
             signNodes.add(signNodesList.item(i));
@@ -193,7 +191,7 @@ public class XMLSignatureHandler {
         return signNodes;
     }
 
-    private boolean validateSignatures(Document xmlDocument, List<Node> signNodes, KeyStore keystore) throws Exception {
+    private static boolean validateSignatures(Document xmlDocument, List<Node> signNodes, KeyStore keystore) throws Exception {
         boolean allSignaturesValid = true;
         for (Node signNode : signNodes) {
             String signatureBase64 = signNode.getTextContent();
@@ -214,7 +212,7 @@ public class XMLSignatureHandler {
         return allSignaturesValid;
     }
 
-    private boolean verifySignature(Document xmlDocument, String signatureBase64, PublicKey publicKey) throws Exception {
+    private static boolean verifySignature(Document xmlDocument, String signatureBase64, PublicKey publicKey) throws Exception {
         Signature signature = Signature.getInstance("SHA256withRSA");
         signature.initVerify(publicKey);
 
